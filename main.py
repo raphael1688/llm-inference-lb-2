@@ -103,7 +103,9 @@ class SchedulerApp:
         self.score_calculator: Optional[ScoreCalculator] = None
         self.api_server = None
         self.running = False
+        self._stopping = False
         self.tasks: List[asyncio.Task] = []
+        self._api_server_task_handle: Optional[asyncio.Task] = None
         # Configuration hot reloader
         self.config_hot_reloader = None
         # API key management components
@@ -485,11 +487,12 @@ class SchedulerApp:
         self.running = True
         
         # Start background tasks (excluding independent scheduled tasks for Score calculation)
+        self._api_server_task_handle = asyncio.create_task(self._api_server_task())
         self.tasks = [
             asyncio.create_task(self._config_monitor_task()),
             asyncio.create_task(self._pool_fetch_task()),
             asyncio.create_task(self._metrics_collection_task()),
-            asyncio.create_task(self._api_server_task()),
+            self._api_server_task_handle,
             asyncio.create_task(self._api_key_sync_task())
         ]
         
@@ -503,16 +506,37 @@ class SchedulerApp:
     
     async def stop(self):
         """Stop scheduler"""
-        self.logger.info("Stopping scheduler...")
+        if self._stopping:
+            return
+        self._stopping = True
         self.running = False
-        
-        # Cancel all tasks
+
+        if self.logger:
+            self.logger.info("Stopping scheduler...")
+        else:
+            print("Stopping scheduler...")
+
+        if self.api_server:
+            self.api_server.request_shutdown()
+
+        # Stop background tasks; let uvicorn exit gracefully before cancelling it
+        for task in self.tasks:
+            if task is not self._api_server_task_handle and not task.done():
+                task.cancel()
+
+        if self._api_server_task_handle and not self._api_server_task_handle.done():
+            try:
+                await asyncio.wait_for(self._api_server_task_handle, timeout=5.0)
+            except asyncio.TimeoutError:
+                self._api_server_task_handle.cancel()
+
         for task in self.tasks:
             if not task.done():
                 task.cancel()
         
         # Wait for task cleanup
-        await asyncio.gather(*self.tasks, return_exceptions=True)
+        if self.tasks:
+            await asyncio.gather(*self.tasks, return_exceptions=True)
         
         # Close connections
         if self.f5_client:
@@ -522,7 +546,10 @@ class SchedulerApp:
         if self.api_key_manager:
             await self.api_key_manager.close()
         
-        self.logger.info("Scheduler stopped")
+        if self.logger:
+            self.logger.info("Scheduler stopped")
+        else:
+            print("Scheduler stopped")
     
     async def _config_monitor_task(self):
         """Configuration file monitoring task (supports hot reload)"""
@@ -652,6 +679,11 @@ class SchedulerApp:
                 await asyncio.gather(*sync_tasks, return_exceptions=True)
             except asyncio.CancelledError:
                 self.logger.info("API key sync tasks cancelled")
+                for task in sync_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*sync_tasks, return_exceptions=True)
+                raise
         else:
             self.logger.info("No XInference pools with API key config found")
     
@@ -1005,13 +1037,24 @@ class SchedulerApp:
 
 
 def setup_signal_handlers(app: SchedulerApp):
-    """Setup signal handlers"""
-    def signal_handler(signum, frame):
-        print(f"\nReceived signal {signum}, shutting down scheduler...")
+    """Setup signal handlers for graceful asyncio shutdown"""
+    loop = asyncio.get_running_loop()
+    shutdown_state = {"requested": False}
+
+    def request_shutdown():
+        if shutdown_state["requested"]:
+            print("\nForce exit...")
+            sys.exit(1)
+        shutdown_state["requested"] = True
+        print("\nReceived shutdown signal, stopping scheduler...")
         asyncio.create_task(app.stop())
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, request_shutdown)
+        except NotImplementedError:
+            # Windows fallback
+            signal.signal(sig, lambda s, f: request_shutdown())
 
 
 async def main():

@@ -50,6 +50,7 @@ class APIServer:
         self.logger = get_logger()
         self.scheduler = Scheduler()
         self.app = self._create_app()
+        self._uvicorn_server = None
     
     def _create_app(self) -> FastAPI:
         """Create FastAPI application"""
@@ -245,7 +246,18 @@ class APIServer:
         )
         
         server = uvicorn.Server(config)
-        await server.serve()
+        # Let the application (main.py) own SIGINT/SIGTERM handling.
+        server.install_signal_handlers = lambda: None
+        self._uvicorn_server = server
+        try:
+            await server.serve()
+        finally:
+            self._uvicorn_server = None
+
+    def request_shutdown(self):
+        """Request graceful uvicorn shutdown."""
+        if self._uvicorn_server is not None:
+            self._uvicorn_server.should_exit = True
     
     def run(self):
         """Run API server synchronously"""

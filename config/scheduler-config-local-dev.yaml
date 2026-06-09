@@ -3,8 +3,7 @@ global:
   # Scheduler checks for configuration changes at this interval in seconds. The program will automatically hot reload.
   interval: 5
   # Scheduler API port for F5 sideband connection. Changing the port requires program restart.
-  api_port: 8181
-  
+  api_port: 8080
   # Scheduler API listening address for F5 sideband connection. Changing the address requires program restart.
   # 0.0.0.0: Listen on all network interfaces (default)
   # 127.0.0.1: Listen only on local loopback interface
@@ -23,8 +22,8 @@ global:
 
 f5:
   #host: host.docker.internal
-  host: 172.16.20.198
-  port: 443
+  host: 127.0.0.1
+  port: 8443
   username: admin
   # Environment variable for password, program needs to read environment variable and replace the value here
   password_env: F5_PASSWORD  
@@ -50,13 +49,13 @@ modes:
     #w_g: 0.2  # running_request weight
 
 pools:
-  - name: pool_gpt-4o
+  - name: example_pool1
     partition: Common
     engine_type: vllm  # Use 'vllm' for all vllm variants, configure specific keys in engines_metrics_keys section
     fallback:
       pool_fallback: false  # Pool level fallback switch, default is false. If true, API will return "fallback" directly
-      #member_running_req_threshold: 100  # Running request threshold for member filtering (optional)，it is the any one logic between member_running_req_threshold and member_waiting_queue_threshold
-      #member_waiting_queue_threshold: 100.0  # Waiting queue threshold for member filtering (optional)，it is the any one logic between member_running_req_threshold and member_waiting_queue_threshold
+      member_running_req_threshold: 100  # Running request threshold for member filtering (optional)，it is the any one logic between member_running_req_threshold and member_waiting_queue_threshold
+      member_waiting_queue_threshold: 100.0  # Waiting queue threshold for member filtering (optional)，it is the any one logic between member_running_req_threshold and member_waiting_queue_threshold
     metrics:
       schema: http
       #port: 5001
@@ -65,11 +64,11 @@ pools:
       APIkey: abcdefdfdsfds
       metric_user: user1
       metric_pwd_env: METRIC_PWD
-  - name: pool_gemini-1.5-pro
+  - name: example_pool2
     partition: Common
     engine_type: sglang
     fallback:
-      pool_fallback: false  # Pool level fallback switch, default is false. If true, API will return "fallback" directly
+      pool_fallback: true  # Pool level fallback switch, default is false. If true, API will return "fallback" directly
       # member_running_req_threshold: 25.0  # Uncomment to enable member filtering by running requests
       # member_waiting_queue_threshold: 10.0  # Uncomment to enable member filtering by waiting queue
     metrics:
@@ -81,15 +80,15 @@ pools:
       metric_user: user1
       metric_pwd_env: METRIC_PWD
 
-#engines_metrics_keys:
+engines_metrics_keys:
   #vllm_ascend: #specific setting for huawei，set it if you are using huawei ascend
     #waiting_queue: vllm:num_requests_waiting
     #cache_usage: vllm:kv_cache_usage_perc
     #running_req: vllm:num_requests_running
-  #vllm_mindie:
-    #waiting_queue: num_requests_waiting
-    #cache_usage: npu_cache_usage_perc
-    #running_req: num_requests_running
+  vllm_mindie:
+    waiting_queue: num_requests_waiting
+    cache_usage: npu_cache_usage_perc
+    running_req: num_requests_running
   #vllm_musa: #specific setting for MUSA,set it if you are using Moore Threads
     #waiting_queue: vllm:num_requests_waiting
     #cache_usage: vllm:gpu_cache_usage_perc
