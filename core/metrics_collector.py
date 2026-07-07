@@ -17,7 +17,12 @@ sys.path.insert(0, str(project_root))
 
 from utils.logger import get_logger
 from utils.exceptions import MetricsCollectionError
-from core.models import PoolMember, Pool, EngineType
+from core.models import (
+    PoolMember, Pool, EngineType, PROMETHEUS_ENGINE_TYPES,
+    DETECTION_STATUS_OK, DETECTION_STATUS_PARTIAL,
+    DETECTION_STATUS_FAILED, DETECTION_STATUS_DEGRADED,
+    compute_member_detection_status,
+)
 # Import the models module to access ENGINE_METRICS_CANDIDATES dynamically
 # This avoids the issue where reassigning the dict in initialize_engine_metrics_candidates
 # would not be visible to this module's imported reference
@@ -131,7 +136,9 @@ class MetricsCollector:
                 if pool.engine_type == EngineType.XINFERENCE:
                     return self._parse_xinference_metrics(response_text, member)
                 else:
-                    return self._parse_prometheus_metrics(response_text, pool.engine_type, member)
+                    metrics = self._parse_prometheus_metrics(response_text, pool, member)
+                    member.detection_status = compute_member_detection_status(member, pool)
+                    return metrics
                 
         except aiohttp.ClientError as e:
             self.logger.warning(f"Network error getting metrics for member {member}: {e}")
@@ -140,26 +147,157 @@ class MetricsCollector:
             self.logger.warning(f"Exception getting metrics for member {member}: {e}")
             return {}
     
+    def _count_family_signature_hits(self, metrics_text: str, engine_type: EngineType) -> int:
+        """Count how many signature keys match for an engine family."""
+        hits = 0
+        for key in models_module.get_engine_family_signatures(engine_type):
+            if self._extract_metric_values(metrics_text, key):
+                hits += 1
+        return hits
+
+    def _detect_engine_family_fallback(self, metrics_text: str) -> Optional[EngineType]:
+        """Stage 1b: infer engine family when signature hits are zero."""
+        for engine_type in PROMETHEUS_ENGINE_TYPES:
+            candidates = models_module.ENGINE_METRICS_CANDIDATES.get(engine_type, {})
+            waiting_keys = candidates.get("waiting_queue", [])
+            cache_keys = candidates.get("cache_usage", [])
+            for waiting_key in waiting_keys:
+                if not self._extract_metric_values(metrics_text, waiting_key):
+                    continue
+                for cache_key in cache_keys:
+                    if self._extract_metric_values(metrics_text, cache_key):
+                        return engine_type
+        return None
+
+    def _detect_engine_family(self, metrics_text: str, member: PoolMember) -> Optional[EngineType]:
+        """Detect vLLM vs SGLang engine family from Prometheus metrics text."""
+        hit_counts = {
+            engine_type: self._count_family_signature_hits(metrics_text, engine_type)
+            for engine_type in PROMETHEUS_ENGINE_TYPES
+        }
+        vllm_hits = hit_counts[EngineType.VLLM]
+        sglang_hits = hit_counts[EngineType.SGLANG]
+
+        if vllm_hits == 0 and sglang_hits == 0:
+            detected = self._detect_engine_family_fallback(metrics_text)
+            if not detected:
+                self.logger.warning(
+                    f"Member {member}: unable to detect engine family in auto mode. "
+                    f"Configure engines_metrics_keys with vllm_* or sglang_* variant entries."
+                )
+            return detected
+
+        if vllm_hits > 0 and sglang_hits > 0:
+            self.logger.error(
+                f"Member {member}: both vLLM ({vllm_hits}) and SGLang ({sglang_hits}) "
+                f"signatures detected; using family with more hits"
+            )
+
+        if vllm_hits >= sglang_hits:
+            return EngineType.VLLM
+        return EngineType.SGLANG
+
+    def _resolve_prometheus_engine_type(
+        self,
+        metrics_text: str,
+        member: PoolMember,
+        pool: Pool
+    ) -> Optional[EngineType]:
+        """Resolve which Prometheus engine family to use for parsing."""
+        if pool.engine_type == EngineType.AUTO:
+            if member.detected_engine_type in PROMETHEUS_ENGINE_TYPES:
+                cached_hits = self._count_family_signature_hits(
+                    metrics_text, member.detected_engine_type
+                )
+                if cached_hits > 0:
+                    return member.detected_engine_type
+
+                other = (
+                    EngineType.SGLANG
+                    if member.detected_engine_type == EngineType.VLLM
+                    else EngineType.VLLM
+                )
+                other_hits = self._count_family_signature_hits(metrics_text, other)
+                if other_hits > 0:
+                    self.logger.warning(
+                        f"Member {member}: engine family changed from "
+                        f"{member.detected_engine_type.value} to {other.value}"
+                    )
+                    member.clear_metrics_key_cache()
+                    member.detected_engine_type = other
+                    return other
+
+                # Engine family sticky when signatures temporarily absent
+                if member.metrics_key_cache:
+                    return member.detected_engine_type
+
+            detected = self._detect_engine_family(metrics_text, member)
+            if detected:
+                member.detected_engine_type = detected
+                self.logger.info(
+                    f"Member {member}: auto-detected engine family '{detected.value}'"
+                )
+            return detected
+
+        return pool.engine_type
+
     def _parse_prometheus_metrics(
-        self, 
-        metrics_text: str, 
-        engine_type: EngineType,
+        self,
+        metrics_text: str,
+        pool: Pool,
         member: PoolMember
     ) -> Dict[str, float]:
         """Parse Prometheus format metrics with automatic key detection
         
         This method tries multiple candidate keys for each metric type,
         caches the detected keys for future use, and tracks which variant
-        the member is using.
+        the member is using. In auto mode, per-member engine family is
+        detected before variant key matching.
         
         Args:
             metrics_text: Raw prometheus format metrics text
-            engine_type: Engine type (VLLM or SGLANG)
+            pool: Pool object (engine_type may be AUTO)
             member: Pool member (used for caching and variant tracking)
             
         Returns:
             Dict with normalized metric names (waiting_queue, cache_usage, running_req)
         """
+        engine_type = self._resolve_prometheus_engine_type(metrics_text, member, pool)
+        if engine_type is None:
+            return {}
+
+        metrics = self._parse_prometheus_metrics_for_engine(metrics_text, engine_type, member)
+
+        # Optional cross-engine fallback for misconfigured homogeneous pools
+        if (
+            not metrics
+            and pool.engine_type in PROMETHEUS_ENGINE_TYPES
+        ):
+            other = (
+                EngineType.SGLANG
+                if pool.engine_type == EngineType.VLLM
+                else EngineType.VLLM
+            )
+            other_metrics = self._parse_prometheus_metrics_for_engine(
+                metrics_text, other, member
+            )
+            if other_metrics:
+                self.logger.warning(
+                    f"Member {member}: pool engine_type={pool.engine_type.value} "
+                    f"but metrics match {other.value}; using detected engine"
+                )
+                member.detected_engine_type = other
+                metrics = other_metrics
+
+        return metrics
+
+    def _parse_prometheus_metrics_for_engine(
+        self,
+        metrics_text: str,
+        engine_type: EngineType,
+        member: PoolMember
+    ) -> Dict[str, float]:
+        """Parse Prometheus metrics for a specific engine family."""
         metrics = {}
         
         try:
@@ -423,28 +561,42 @@ class MetricsCollector:
                     model_count = len(member.model_metrics)
                     self.logger.debug(f"XInference member {member}: {model_count} models with metrics")
                 else:
-                    # Log with detected variant info
-                    variant_info = f" (variant: {member.detected_variant})" if member.detected_variant else ""
+                    variant_info = ""
+                    if member.detected_variant:
+                        variant_info = f" (variant: {member.detected_variant})"
+                    if pool.is_auto() and member.detected_engine_type:
+                        variant_info += f" (engine: {member.detected_engine_type.value})"
                     self.logger.debug(f"Prometheus member {member}{variant_info}: {result}")
         
         # Summary with variant information for non-xinference pools
         if pool.engine_type != EngineType.XINFERENCE:
             variant_summary = {}
+            engine_summary = {}
             for member in pool.members:
                 if member.detected_variant:
-                    variant_summary[member.detected_variant] = variant_summary.get(member.detected_variant, 0) + 1
-            
+                    variant_summary[member.detected_variant] = (
+                        variant_summary.get(member.detected_variant, 0) + 1
+                    )
+                if pool.is_auto() and member.detected_engine_type:
+                    engine_name = member.detected_engine_type.value
+                    engine_summary[engine_name] = engine_summary.get(engine_name, 0) + 1
+
+            parts = [f"{successful_count}/{len(pool.members)} members successful"]
+            if engine_summary:
+                engine_str = ", ".join([f"{e}: {c}" for e, c in engine_summary.items()])
+                parts.append(f"engines: [{engine_str}]")
             if variant_summary:
                 variant_str = ", ".join([f"{v}: {c}" for v, c in variant_summary.items()])
-                self.logger.info(
-                    f"Completed metrics collection for Pool {pool.name}: "
-                    f"{successful_count}/{len(pool.members)} members successful, "
-                    f"variants: [{variant_str}]"
-                )
-            else:
-                self.logger.info(f"Completed metrics collection for Pool {pool.name}: {successful_count}/{len(pool.members)} members successful")
+                parts.append(f"variants: [{variant_str}]")
+
+            self.logger.info(
+                f"Completed metrics collection for Pool {pool.name}: " + ", ".join(parts)
+            )
         else:
-            self.logger.info(f"Completed metrics collection for Pool {pool.name}: {successful_count}/{len(pool.members)} members successful")
+            self.logger.info(
+                f"Completed metrics collection for Pool {pool.name}: "
+                f"{successful_count}/{len(pool.members)} members successful"
+            )
     
     async def close(self):
         """Close collector"""

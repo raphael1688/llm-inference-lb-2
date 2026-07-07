@@ -17,7 +17,7 @@ global:
   # WARNING: Show only WARNING, ERROR, CRITICAL level logs
   # ERROR: Show only ERROR, CRITICAL level logs
   # CRITICAL: Show only CRITICAL level logs
-  log_level: DEBUG
+  log_level: WARNING
   # Backward compatibility debug switch (used when log_level is not configured)
   #log_debug: False
 

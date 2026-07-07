@@ -12,12 +12,24 @@ class EngineType(Enum):
     VLLM = "vllm"
     SGLANG = "sglang"
     XINFERENCE = "xinference"
+    AUTO = "auto"
+
+
+# Prometheus-based engine families supported in heterogeneous (auto) pools
+PROMETHEUS_ENGINE_TYPES = (EngineType.VLLM, EngineType.SGLANG)
+
+# Member engine detection status for observability
+DETECTION_STATUS_OK = "ok"
+DETECTION_STATUS_PARTIAL = "partial"
+DETECTION_STATUS_FAILED = "failed"
+DETECTION_STATUS_DEGRADED = "degraded"
 
 
 class PoolMember:
     """Pool member data model"""
-    __slots__ = ("ip", "port", "partition", "metrics", "score", "model_metrics", 
-                 "model_scores", "metrics_key_cache", "detected_variant")
+    __slots__ = ("ip", "port", "partition", "metrics", "score", "model_metrics",
+                 "model_scores", "metrics_key_cache", "detected_variant",
+                 "detected_engine_type", "detection_status")
     
     def __init__(self, ip: str, port: int, partition: str):
         self.ip: str = ip
@@ -34,6 +46,10 @@ class PoolMember:
         self.metrics_key_cache: Dict[str, str] = {}
         # Detected variant name for this member (e.g., "vllm_ascend", "vllm", "sglang_xxx")
         self.detected_variant: Optional[str] = None
+        # Detected base engine family for auto pools (vllm or sglang)
+        self.detected_engine_type: Optional[EngineType] = None
+        # Detection health: ok / partial / failed / degraded
+        self.detection_status: Optional[str] = None
     
     def metric_uri(self, schema: str, path: str, metrics_port: Optional[int] = None) -> str:
         """Construct metrics interface URI
@@ -102,12 +118,14 @@ class PoolMember:
         return model_name and model_name in self.model_metrics
     
     def clear_metrics_key_cache(self) -> None:
-        """Clear cached metrics keys and detected variant
+        """Clear cached metrics keys and detection state
         
         Called when configuration changes or when cached key becomes invalid
         """
         self.metrics_key_cache = {}
         self.detected_variant = None
+        self.detected_engine_type = None
+        self.detection_status = None
 
 
 class Pool:
@@ -150,6 +168,8 @@ class Pool:
                 new_member.model_metrics = existing_member.model_metrics
                 new_member.metrics_key_cache = existing_member.metrics_key_cache
                 new_member.detected_variant = existing_member.detected_variant
+                new_member.detected_engine_type = existing_member.detected_engine_type
+                new_member.detection_status = existing_member.detection_status
                 updated_members.append(new_member)
             else:
                 # New member, use default initial values (no cache, will auto-detect)
@@ -195,6 +215,10 @@ class Pool:
     def is_xinference(self) -> bool:
         """Check if this pool is XInference type"""
         return self.engine_type == EngineType.XINFERENCE
+
+    def is_auto(self) -> bool:
+        """Check if this pool uses per-member engine auto-detection"""
+        return self.engine_type == EngineType.AUTO
     
     def get_members_with_model(self, model_name: str) -> List[PoolMember]:
         """Get members that have metrics for specific model (XInference)
@@ -373,6 +397,72 @@ def get_candidates_summary() -> Dict[str, Dict[str, int]]:
             metric_type: len(keys) for metric_type, keys in metrics.items()
         }
     return summary
+
+
+def get_engine_family_signatures(engine_type: EngineType) -> List[str]:
+    """Collect all signature keys for an engine family (built-in + user variants).
+
+    Used for stage-1 family detection in auto mode.
+    """
+    if engine_type not in PROMETHEUS_ENGINE_TYPES:
+        return []
+
+    seen = set()
+    signatures: List[str] = []
+
+    def _add(key: Optional[str]) -> None:
+        if key and key not in seen:
+            seen.add(key)
+            signatures.append(key)
+
+    base_metrics = BASE_ENGINE_METRICS.get(engine_type, {})
+    for key in base_metrics.values():
+        _add(key)
+
+    candidates = ENGINE_METRICS_CANDIDATES.get(engine_type, {})
+    for metric_type in ["waiting_queue", "cache_usage", "running_req"]:
+        for key in candidates.get(metric_type, []):
+            _add(key)
+
+    return signatures
+
+
+def infer_engine_type_from_metric_key(key: str) -> Optional[EngineType]:
+    """Infer base engine type from a matched metrics key."""
+    variant = METRICS_KEY_VARIANT_MAP.get(key)
+    if variant:
+        return _infer_base_engine(variant)
+    return None
+
+
+def get_effective_engine_type(member: PoolMember, pool: Pool) -> Optional[EngineType]:
+    """Return the engine type used for metrics parsing and scoring for a member."""
+    if pool.engine_type == EngineType.AUTO:
+        return member.detected_engine_type
+    if pool.engine_type == EngineType.XINFERENCE:
+        return EngineType.XINFERENCE
+    return pool.engine_type
+
+
+def compute_member_detection_status(member: PoolMember, pool: Pool) -> str:
+    """Compute detection status from current member state."""
+    if pool.engine_type == EngineType.XINFERENCE:
+        return DETECTION_STATUS_OK if member.model_metrics else DETECTION_STATUS_FAILED
+
+    if pool.engine_type == EngineType.AUTO and member.detected_engine_type is None:
+        return DETECTION_STATUS_FAILED
+
+    metrics = member.metrics or {}
+    has_waiting = "waiting_queue" in metrics
+    has_cache = "cache_usage" in metrics
+
+    if has_waiting and has_cache:
+        return DETECTION_STATUS_OK
+    if has_waiting or has_cache:
+        return DETECTION_STATUS_PARTIAL
+    if member.detected_engine_type and member.metrics_key_cache:
+        return DETECTION_STATUS_DEGRADED
+    return DETECTION_STATUS_FAILED
 
 
 # ============================================================================

@@ -132,7 +132,7 @@ class ConfigLoader:
     """Configuration loader"""
     
     # Supported engine types
-    SUPPORTED_ENGINE_TYPES = ['vllm', 'sglang', 'xinference']
+    SUPPORTED_ENGINE_TYPES = ['vllm', 'sglang', 'xinference', 'auto']
     
     def __init__(self, config_file: str = "config/scheduler-config.yaml"):
         self.config_file = config_file
@@ -328,7 +328,8 @@ class ConfigLoader:
             raise ConfigurationError(
                 f"Pool {pool.name} has unsupported engine_type '{pool.engine_type}'. "
                 f"Supported types: {', '.join(self.SUPPORTED_ENGINE_TYPES)}. "
-                f"For vllm variants (vllm_ascend, vllm_musa, etc.), use 'vllm' as engine_type "
+                f"Use 'auto' for heterogeneous vLLM+SGLang pools. "
+                f"For vllm variants (vllm_ascend, vllm_musa, etc.), use 'vllm' or 'auto' as engine_type "
                 f"and configure the variant in 'engines_metrics_keys' section."
             )
         

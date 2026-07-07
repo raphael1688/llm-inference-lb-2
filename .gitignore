@@ -23,3 +23,5 @@ docs/local-docs/
 *.zip
 *.tar
 *.tar.gz
+
+.cursor/plans

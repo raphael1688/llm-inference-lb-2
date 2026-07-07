@@ -14,6 +14,7 @@ An intelligent scheduler for LLM inference gateway, designed to work with F5 LTM
 
 - **Intelligent Scheduling Algorithm**: S1,S2. Based on different LLM server metrics
 - **Multi-Engine Support**: Supports vLLM and SGLang inference engines, including variants (e.g., vllm_ascend, vllm_musa, vllm-mlu)
+- **Heterogeneous Engine Pool**: `engine_type: auto` enables vLLM + SGLang mixed pools with per-member automatic engine detection
 - **Real-time Monitoring**: Automatically fetches F5 Pool members and inference engine performance metrics
 - **High Availability Design**: Asynchronous architecture with concurrent processing support
 - **RESTful API**: Provides standard HTTP interfaces
@@ -319,7 +320,9 @@ none
         "waiting_queue": 2.0,
         "cache_usage": 0.3
       },
-      "detected_variant": "vllm_ascend"
+      "detected_variant": "vllm_ascend",
+      "detected_engine_type": "vllm",
+      "detection_status": "ok"
     },
     {
       "ip": "10.10.10.10",
@@ -329,7 +332,9 @@ none
         "waiting_queue": 1.5,
         "cache_usage": 0.25
       },
-      "detected_variant": "vllm"
+      "detected_variant": "vllm",
+      "detected_engine_type": "vllm",
+      "detection_status": "ok"
     }
   ]
 }
@@ -517,7 +522,7 @@ none
 |-------------|------|----------|---------|-------------|
 | `name` | String | **Yes** | None | Pool name, must match Pool name on F5 |
 | `partition` | String | No | "Common" | Partition name on F5 |
-| `engine_type` | String | **Yes** | None | Inference engine type (vllm/sglang) |
+| `engine_type` | String | **Yes** | None | Inference engine type: `vllm`, `sglang`, or `auto` (heterogeneous pool) |
 
 ### Fallback Configuration (pools[].fallback)
 
@@ -557,6 +562,7 @@ none
 **Notes**:
 - Variant names must start with `vllm` or `sglang`
 - All metric keys within a variant are optional; unconfigured keys use built-in defaults
+- For homogeneous pools, set `engine_type` to `vllm` or `sglang` and configure variant keys in `engines_metrics_keys`; for heterogeneous pools, use `auto` (see **Heterogeneous Engine Pool** section)
 - The scheduler automatically detects which variant each member uses based on available metrics
 
 ### Configuration Example
@@ -679,13 +685,111 @@ engines_metrics_keys:
 
 **Key Points**:
 - **Variant naming**: Must start with `vllm` or `sglang` (underscore or hyphen allowed, e.g., `vllm_ascend`, `vllm-mlu`)
-- **Pool engine_type**: Always use base type (`vllm` or `sglang`) in pool configuration, not the variant name
+- **Pool engine_type**: Use `vllm` or `sglang` for homogeneous pools; use `auto` for heterogeneous pools (see below). Do not use variant names as `engine_type`
 - **Optional keys**: Only configure keys that differ from the built-in standard; unconfigured keys fall back to built-in defaults
 - **Priority**: User-configured variant keys are tried first, then fall back to built-in keys
 - **Auto-detection**: The scheduler automatically detects which variant a member is using based on available metrics
 - **Hot reload**: Changes to `engines_metrics_keys` are hot-reloaded and take effect on the next metrics collection cycle
 
-**API Response**: The `/pools/{pool_name}/{partition}/status` endpoint includes a `detected_variant` field for each member, showing which variant was detected (e.g., `vllm_ascend`, `vllm`, `sglang_xxx`)
+**API Response**: The `/pools/{pool_name}/{partition}/status` endpoint includes `detected_variant`, `detected_engine_type` (for `auto` pools), and `detection_status` (`ok` / `partial` / `failed` / `degraded`) for each member.
+
+### Heterogeneous Engine Pool (`engine_type: auto`)
+
+When a **single F5 Pool** contains members running different Prometheus-based inference engines (e.g., vLLM and SGLang mixed together, including their variants), set `engine_type: auto`. The scheduler automatically detects each member's **engine family** (vLLM or SGLang) and **variant** from a single `/metrics` scrape—no per-member manual labeling is required.
+
+**Typical use cases**:
+- One F5 Pool with both vLLM and SGLang backends serving the same model endpoint
+- Mixed standard and variant members (e.g., standard vLLM + Huawei Ascend vLLM + standard SGLang) in one pool
+
+**Configuration example**:
+
+```yaml
+pools:
+  - name: pool_mixed_llm
+    partition: Common
+    engine_type: auto          # Heterogeneous pool: auto-detect vLLM / SGLang per member
+    fallback:
+      pool_fallback: false
+    metrics:
+      schema: http
+      path: /metrics
+      timeout: 4
+
+# Optional: only needed when members use non-standard metric key names
+engines_metrics_keys:
+  vllm_v0_8:                 # Prefix vllm → vLLM candidate pool
+    waiting_queue: vllm:pending_requests
+    cache_usage: vllm:kv_cache_usage_perc
+    running_req: vllm:active_requests
+  sglang_v2:                 # Prefix sglang → SGLang candidate pool
+    waiting_queue: sglang:pending_req
+    cache_usage: sglang:token_usage_v2
+    running_req: sglang:running_req_v2
+  vllm_mindie:               # Variant without vllm: prefix (e.g., MindIE)
+    waiting_queue: num_requests_waiting
+    cache_usage: npu_cache_usage_perc
+    running_req: num_requests_running
+```
+
+**How auto-detection works**:
+
+1. **Stage 1 — Engine family**: Scan Prometheus metrics for vLLM / SGLang signature keys (built-in + user-configured `engines_metrics_keys`). Each member is classified independently.
+2. **Stage 2 — Variant keys**: Within the detected family, match metric keys by priority (user variants first, then built-in defaults) and cache results for steady-state performance.
+
+**`engine_type` comparison**:
+
+| Value | Pool type | Behavior |
+|-------|-----------|----------|
+| `vllm` | Homogeneous | Only vLLM metric keys are scanned; best cold-start performance |
+| `sglang` | Homogeneous | Only SGLang metric keys are scanned |
+| `auto` | Heterogeneous | Per-member vLLM / SGLang detection; standard members need no extra config |
+
+**`engines_metrics_keys` rules in auto mode**:
+- Use **one top-level entry per variant**; the variant name prefix (`vllm_*` / `sglang_*`) determines which engine family the keys belong to
+- Do **not** combine vLLM and SGLang keys under a single variant entry
+- Standard vLLM / SGLang members work without any variant configuration
+
+**`detection_status` values** (visible in `/pools/.../status`):
+
+| Status | Meaning |
+|--------|---------|
+| `ok` | Engine family detected; required metrics (`waiting_queue`, `cache_usage`) collected |
+| `partial` | Engine family detected but a required metric is missing |
+| `failed` | Engine family not detected, or no usable metrics |
+| `degraded` | Previously cached keys temporarily unavailable; re-probing in progress |
+
+**API response example** (`engine_type: auto`):
+
+```json
+{
+  "name": "pool_mixed_llm",
+  "partition": "Common",
+  "engine_type": "auto",
+  "member_count": 2,
+  "members": [
+    {
+      "ip": "10.0.0.1",
+      "port": 8001,
+      "score": 0.72,
+      "metrics": { "waiting_queue": 12.0, "cache_usage": 0.35, "running_req": 5.0 },
+      "detected_variant": "vllm",
+      "detected_engine_type": "vllm",
+      "detection_status": "ok"
+    },
+    {
+      "ip": "10.0.0.2",
+      "port": 8010,
+      "score": 0.85,
+      "metrics": { "waiting_queue": 3.0, "cache_usage": 0.55, "running_req": 2.0 },
+      "detected_variant": "sglang",
+      "detected_engine_type": "sglang",
+      "detection_status": "ok"
+    }
+  ]
+}
+```
+
+> **Note**: `auto` mode supports vLLM and SGLang (Prometheus `/metrics`) only. XInference uses a different metrics protocol and should be configured in a separate pool with `engine_type: xinference`.
 
 ## Runtime Monitoring
 

@@ -54,3 +54,5 @@ LICENSE
 # 临时文件
 *.tmp
 *.temp 
+
+./cusror/plans

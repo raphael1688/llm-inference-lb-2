@@ -14,7 +14,7 @@ sys.path.insert(0, str(project_root))
 
 from utils.logger import get_logger
 from utils.exceptions import SchedulingError
-from core.models import Pool, PoolMember, get_pool_by_key, EngineType
+from core.models import Pool, PoolMember, get_pool_by_key, EngineType, compute_member_detection_status
 
 
 class WeightedRandomSelector:
@@ -391,7 +391,15 @@ class Scheduler:
                 "score": member.score,
                 "percent": round(percent, 2),  # Keep 2 decimal places
                 "metrics": member.metrics,
-                "detected_variant": member.detected_variant  # Detected engine variant (e.g., vllm_ascend, vllm, sglang_xxx)
+                "detected_variant": member.detected_variant,
+                "detected_engine_type": (
+                    member.detected_engine_type.value
+                    if member.detected_engine_type else None
+                ),
+                "detection_status": (
+                    member.detection_status
+                    or compute_member_detection_status(member, pool)
+                ),
             }
             status["members"].append(member_info)
         
